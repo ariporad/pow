@@ -17,6 +17,8 @@ RackApplication = require "./rack_application"
 
 {version} = JSON.parse fs.readFileSync __dirname + "/../package.json", "utf8"
 
+ApplicationTypes = {} # TODO: figure out a way to get/set this
+
 # `HttpServer` is a subclass of
 # [Connect](http://senchalabs.github.com/connect/)'s `HTTPServer` with
 # a custom set of middleware and a reference to a Pow `Configuration`.
@@ -54,9 +56,8 @@ module.exports = class HttpServer extends connect.HTTPServer
       o @handlePowRequest
       o @findHostConfiguration
       o @handleStaticRequest
-      o @findRackApplication
+      o @findApplication
       o @handleProxyRequest
-      o @handleRvmDeprecationRequest
       o @handleApplicationRequest
       x @handleErrorStartingApplication
       o @handleFaviconRequest
@@ -160,11 +161,53 @@ module.exports = class HttpServer extends connect.HTTPServer
     handler = @staticHandlers[root] ?= connect.static(join(root, "public"), redirect: false)
     handler req, res, next
 
+
+  findApplication: (req, res, next) =>
+    return next() unless root = req.pow.root
+
+    appType = null
+    setupApp = (config) ->
+      if config.type and ApplicationTypes[config.type]
+        appType = ApplicationTypes[config.type]
+      unless appType
+        for name, type in ApplicationTypes
+          type.detect ?= require "#{name}/detect"
+          if type.detect root, config
+            appType = type
+      unless appType
+        # TODO: Prob. shouldn't delete the app if no type is detected
+        if application = @rackApplications[root]
+          delete @rackApplications[root]
+          application.quit()
+        return next();
+      # Applications (for pow-app-type): pow-app-type is Application subclass, pow-app-type/detect is a function
+      req.pow.application = @applications[root] ?=
+        appType.Application @configuration, root, req.pow.host
+
+    fs.exists join(root, ".powrc"), (powConfigExists) =>
+      if powConfigExists
+        fs.readFile join(root, ".powrc"), (powConfig) ->
+          config = {}
+          try
+            config = JSON.parse powConfig
+          finally
+            setupApp config
+      else
+        setupApp {}
+
+
+      next()
+
+
+
+
+
   # Check to see if the application root contains a `config.ru`
   # file. If it does, find the existing `RackApplication` instance for
   # the root, or create and cache a new one. Then annotate the request
   # object with the application so it can be handled by
   # `handleApplicationRequest`.
+  # === RACK ===
   findRackApplication: (req, res, next) =>
     return next() unless root = req.pow.root
 
@@ -213,33 +256,6 @@ module.exports = class HttpServer extends connect.HTTPServer
 
     req.pow.resume()
 
-  # Handle requests for the mini-app that serves RVM deprecation
-  # notices. Manually requesting `/__pow__/rvm_deprecation` on any
-  # Rack app will show the notice. The notice is automatically
-  # displayed in a separate browser window by `RackApplication` the
-  # first time you load an app with an `.rvmrc` file.
-  handleRvmDeprecationRequest: (req, res, next) =>
-    return next() unless application = req.pow.application
-
-    if match = req.url.match /^\/__pow__\/rvm_deprecation(.*)/
-      action = match[1]
-      return next() unless action is "" or req.method is "POST"
-
-      switch action
-        when ""
-          true
-        when "/add_to_powrc"
-          application.writeRvmBoilerplate()
-        when "/enable"
-          @configuration.enableRvmDeprecationNotices()
-        when "/disable"
-          @configuration.disableRvmDeprecationNotices()
-        else
-          return next()
-      renderResponse res, 200, "rvm_deprecation_notice",
-        boilerplate: RackApplication.rvmBoilerplate
-    else
-      next()
 
   # If the request object is annotated with an application, pass the
   # request off to the application's `handle` method.
